@@ -50,20 +50,30 @@ func (m *memTable) put(seq uint64, kind uint8, key, value []byte, db *DB) {
 }
 
 func encodeInternalKey(buf *bytes.Buffer, seq uint64, kind uint8, key []byte) {
+	// เขียน key ก่อน
 	buf.Write(key)
-	var seqBytes [8]byte
-	binary.LittleEndian.PutUint64(seqBytes[:], (seq<<8)|uint64(kind))
-	buf.Write(seqBytes[:])
+
+	// เขียน sequence number และ kind (8 bytes) ในรูปแบบ BigEndian
+	seqAndKind := (seq << 8) | uint64(kind)
+	binary.BigEndian.PutUint64(buf.Bytes()[buf.Len():buf.Len()+8], seqAndKind)
+	buf.Write(make([]byte, 8)) // เพิ่มพื้นที่ 8 bytes
+	binary.BigEndian.PutUint64(buf.Bytes()[buf.Len()-8:], seqAndKind)
 }
 
 func decodeInternalKey(ik []byte) ([]byte, uint64, uint8) {
-	if len(ik) < 9 {
+	if len(ik) < 8 {
 		return nil, 0, 0
 	}
-	n := len(ik)
-	seq := binary.BigEndian.Uint64(ik[n-9 : n-1])
-	kind := ik[n-1]
-	key := ik[:n-9]
+
+	// แยกส่วน sequence number และ kind จาก 8 bytes สุดท้าย
+	seqAndKind := binary.BigEndian.Uint64(ik[len(ik)-8:])
+	seq := seqAndKind >> 8
+	kind := uint8(seqAndKind & 0xFF)
+
+	// key คือส่วนที่เหลือ (ไม่รวม 8 bytes สุดท้าย)
+	key := make([]byte, len(ik)-8)
+	copy(key, ik[:len(ik)-8])
+
 	return key, seq, kind
 }
 

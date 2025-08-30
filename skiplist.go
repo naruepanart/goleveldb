@@ -42,21 +42,16 @@ func (s *skipList) put(key, value []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	nk := make([]byte, len(key))
-	copy(nk, key)
-	nv := make([]byte, len(value))
-	if value != nil {
-		copy(nv, value)
-	}
-
 	prev := make([]*node, maxHeight)
 	x := s.findGreaterOrEqual(key, prev)
 
-	if x != nil && bytesEqual(x.key, nk) {
-		x.value = nv
+	// ถ้ามี key อยู่แล้วให้อัปเดตค่า
+	if x != nil && bytesEqual(x.key, key) {
+		x.value = value
 		return
 	}
 
+	// สร้าง node ใหม่
 	height := randomHeight()
 	if height > int(s.height) {
 		for i := int(s.height); i < height; i++ {
@@ -65,15 +60,15 @@ func (s *skipList) put(key, value []byte) {
 		atomic.StoreInt32(&s.height, int32(height))
 	}
 
-	x = &node{
-		key:   nk,
-		value: nv,
+	newNode := &node{
+		key:   key,
+		value: value,
 		next:  make([]unsafe.Pointer, height),
 	}
 
 	for i := 0; i < height; i++ {
-		x.next[i] = prev[i].next[i]
-		prev[i].next[i] = unsafe.Pointer(x)
+		newNode.next[i] = unsafe.Pointer(prev[i].next[i])
+		atomic.StorePointer(&prev[i].next[i], unsafe.Pointer(newNode))
 	}
 }
 
@@ -97,28 +92,42 @@ func bytesEqual(a, b []byte) bool {
 }
 
 func (s *skipList) iterator() *memTableIterator {
-	return &memTableIterator{list: s}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return &memTableIterator{
+		list:    s,
+		current: nil,
+	}
 }
 
 func bytesCompare(a, b []byte) int {
-	// Handle nil cases
-	if a == nil && b == nil {
-		return 0
-	}
-	if a == nil {
-		return -1
-	}
-	if b == nil {
-		return 1
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
 	}
 
-	// Compare the raw bytes directly
-	return bytes.Compare(a, b)
+	for i := 0; i < minLen; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
 }
 
 func (s *skipList) findGreaterOrEqual(key []byte, prev []*node) *node {
 	x := s.head
 	level := int(s.height) - 1
+
 	for {
 		next := (*node)(atomic.LoadPointer(&x.next[level]))
 		if next != nil && bytesCompare(next.key, key) < 0 {

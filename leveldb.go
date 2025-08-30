@@ -54,47 +54,38 @@ type CompactionRange struct {
 }
 
 type DB struct {
-	mu             sync.RWMutex
-	name           string
-	opts           *Options
-	mem            *memTable
-	imm            *memTable
-	manifestFile   *os.File
-	logFile        *os.File
-	logNumber      uint64
-	nextFileNumber uint64
-	sequenceNumber atomic.Uint64
-	compactionCond *sync.Cond
-	compactionMu   sync.Mutex
-	closing        atomic.Bool
-	compacting     atomic.Bool
-	compactionWg   sync.WaitGroup
-	writeStallMu   sync.Mutex
-	writeStallCond *sync.Cond
-
-	// Level-based compaction fields
+	mu                          sync.RWMutex
+	name                        string
+	opts                        *Options
+	mem                         *memTable
+	imm                         *memTable
+	manifestFile                *os.File
+	logFile                     *os.File
+	logNumber                   uint64
+	nextFileNumber              uint64
+	sequenceNumber              atomic.Uint64
+	compactionCond              *sync.Cond
+	compactionMu                sync.Mutex
+	closing                     atomic.Bool
+	compacting                  atomic.Bool
+	compactionWg                sync.WaitGroup
+	writeStallMu                sync.Mutex
+	writeStallCond              *sync.Cond
 	levels                      []*Level
 	level0CompactionTrigger     int
 	level0SlowdownWritesTrigger int
 	level0StopWritesTrigger     int
-
-	// Snapshot support
-	snapshots    []*Snapshot
-	snapshotMu   sync.Mutex
-	snapshotRefs map[uint64]*Snapshot
-
-	// Manual compaction
-	manualCompactionChan chan *CompactionRange
-	levelMu              []sync.RWMutex
-
-	stats DBStats
-
-	compactionStates    []*compactionState
-	compactionSemaphore chan struct{}
-	compactionStats     map[string]int64
-
-	compactionSem chan struct{} // Semaphore for compaction concurrency
-	readOnly      atomic.Bool   // Atomic read-only mode flag
+	snapshots                   []*Snapshot
+	snapshotMu                  sync.Mutex
+	snapshotRefs                map[uint64]*Snapshot
+	manualCompactionChan        chan *CompactionRange
+	levelMu                     []sync.RWMutex
+	stats                       DBStats
+	compactionStates            []*compactionState
+	compactionSemaphore         chan struct{}
+	compactionStats             map[string]int64
+	compactionSem               chan struct{}
+	readOnly                    atomic.Bool
 }
 
 type DBStats struct {
@@ -427,3 +418,5 @@ func (db *DB) updateSSTableCount(count int) {
 	defer db.stats.mu.Unlock()
 	db.stats.SSTableCount = int64(count)
 }
+
+

@@ -54,7 +54,9 @@ func (db *DB) getOldestSnapshot() uint64 {
 }
 
 func (db *DB) Get(opts *ReadOptions, key []byte) ([]byte, error) {
-	db.incrementReads()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	var seq uint64
 	if opts != nil && opts.Snapshot != nil {
 		seq = opts.Snapshot.sequenceNumber
@@ -62,45 +64,50 @@ func (db *DB) Get(opts *ReadOptions, key []byte) ([]byte, error) {
 		seq = db.sequenceNumber.Load()
 	}
 
-	// Check memtable first
-	if value, err := db.mem.get(key, seq); err == nil {
-		return value, nil
+	// ค้นหาใน memtable ก่อน
+	if db.mem != nil {
+		if value, err := db.mem.get(key, seq); err == nil {
+			return value, nil
+		}
 	}
 
-	// Check immutable memtable
+	// ค้นหาใน immutable memtable
 	if db.imm != nil {
 		if value, err := db.imm.get(key, seq); err == nil {
 			return value, nil
 		}
 	}
 
-	// Check SSTables
-	return db.getFromSSTables(key, seq)
+	// ค้นหาใน SSTables
+	if value, err := db.getFromSSTables(key, seq); err == nil {
+		return value, nil
+	}
+
+	return nil, ErrNotFound
 }
 
-// In memTable.get, only return values visible to the specified sequence number.
 func (m *memTable) get(key []byte, maxSeq uint64) ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	m.buf.Reset()
-	encodeInternalKey(m.buf, maxSeq, typeValue, key)
-	searchKey := m.buf.Bytes()
+	if m.table == nil {
+		return nil, ErrNotFound
+	}
+
 	iter := m.table.iterator()
-	iter.Seek(searchKey)
-	for iter.Valid() {
-		internalKey := iter.Key()
-		userKey, seq, kind := decodeInternalKey(internalKey)
-		if !bytes.Equal(userKey, key) {
-			break
-		}
-		if seq <= maxSeq {
+	iter.Seek(key)
+
+	if iter.Valid() {
+		currentKey := iter.Key()
+		decodedKey, seq, kind := decodeInternalKey(currentKey)
+
+		if bytes.Equal(decodedKey, key) && seq <= maxSeq {
 			if kind == typeDeletion {
 				return nil, ErrNotFound
 			}
 			return iter.Value(), nil
 		}
-		iter.Next()
 	}
+
 	return nil, ErrNotFound
 }

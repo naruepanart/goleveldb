@@ -19,7 +19,16 @@ type memTableIterator struct {
 }
 
 func (it *memTableIterator) Seek(target []byte) {
-	it.current = it.list.findGreaterOrEqual(target, nil)
+	if it.list == nil {
+		it.current = nil
+		return
+	}
+
+	it.list.mu.RLock()
+	defer it.list.mu.RUnlock()
+
+	x := it.list.findGreaterOrEqual(target, nil)
+	it.current = x
 }
 
 func (it *memTableIterator) Error() error {
@@ -30,28 +39,28 @@ func (it *memTableIterator) SeekToFirst() {
 	it.current = (*node)(it.list.head.next[0])
 }
 
-func (it *memTableIterator) Valid() bool {
-	return it.current != nil && it.current.next[0] != nil
-}
-
 func (it *memTableIterator) Next() {
 	if it.current != nil {
 		it.current = (*node)(it.current.next[0])
 	}
 }
 
+func (it *memTableIterator) Valid() bool {
+	return it.current != nil
+}
+
 func (it *memTableIterator) Key() []byte {
-	if it.current != nil {
-		return it.current.key
+	if it.current == nil {
+		return nil
 	}
-	return nil
+	return it.current.key
 }
 
 func (it *memTableIterator) Value() []byte {
-	if it.current != nil {
-		return it.current.value
+	if it.current == nil {
+		return nil
 	}
-	return nil
+	return it.current.value
 }
 
 func (it *memTableIterator) SeekToLast() {

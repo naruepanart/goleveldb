@@ -1,4 +1,3 @@
-// db_ops.go
 package main
 
 import (
@@ -70,7 +69,6 @@ func Open(name string, opts *Options) (*DB, error) {
 		snapshotRefs:         make(map[uint64]*Snapshot),
 	}
 
-	// Initialize levels before recovery
 	db.initLevels()
 
 	// Create directory if it doesn't exist
@@ -510,38 +508,44 @@ func encodeLogEntry(seq uint64, kind uint8, key, value []byte) []byte {
 	return buf
 }
 
-func (db *DB) Put(opts *WriteOptions, key, value []byte) error {
-	return db.writeInternal(opts, key, value, typeValue)
-}
-
 func (db *DB) Delete(opts *WriteOptions, key []byte) error {
 	return db.writeInternal(opts, key, nil, typeDeletion)
+}
+
+func (db *DB) Put(opts *WriteOptions, key, value []byte) error {
+	return db.writeInternal(opts, key, value, typeValue)
 }
 
 func (db *DB) writeInternal(opts *WriteOptions, key, value []byte, kind uint8) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// เพิ่ม sequence number
 	seq := db.sequenceNumber.Add(1)
-	entry := encodeLogEntry(seq, kind, key, value)
 
-	if db.logFile != nil {
-		if _, err := db.logFile.Write(entry); err != nil {
-			return fmt.Errorf("write to log failed: %w", err)
-		}
-		if opts.Sync {
-			if err := db.logFile.Sync(); err != nil {
-				return fmt.Errorf("log sync failed: %w", err)
-			}
-		}
+	// เขียนลง memtable
+	if db.mem == nil {
+		db.mem = newMemTable(db)
 	}
-
 	db.mem.put(seq, kind, key, value, db)
-	db.updateMemtableSize(db.mem.approximateMemoryUsage())
 
-	if db.mem.approximateMemoryUsage() > db.opts.WriteBufferSize {
-		go db.switchMemTable()
+	// เขียนลง write-ahead log
+	entry := encodeLogEntry(seq, kind, key, value)
+	if db.logFile != nil {
+		_, err := db.logFile.Write(entry)
+		if err != nil {
+			return err
+		}
+		if opts != nil && opts.Sync {
+			db.logFile.Sync()
+		}
 	}
+
+	// ตรวจสอบว่าต้องการ switch memtable หรือไม่
+	if db.mem.approximateMemoryUsage() >= db.opts.WriteBufferSize {
+		db.switchMemTable()
+	}
+
 	return nil
 }
 
@@ -1142,13 +1146,12 @@ type indexEntry struct {
 }
 
 func (db *DB) recover() error {
+	db.initLevels()
+
 	var maxLogNumber uint64 = 0
 	var maxSSTNumber uint64 = 0
 	var logFiles []string
 	var recoveryErrors []error
-
-	// Initialize levels before scanning SST files
-	db.initLevels()
 
 	// Scan database directory for existing files
 	files, err := os.ReadDir(db.name)
@@ -1214,16 +1217,18 @@ func (db *DB) recover() error {
 }
 
 func (db *DB) initLevels() {
-	if db.levels != nil {
-		return
-	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-	db.levels = make([]*Level, db.opts.MaxLevels)
-	for i := 0; i < db.opts.MaxLevels; i++ {
-		db.levels[i] = &Level{
-			level:      i,
-			sstFiles:   make([]*SSTFile, 0),
-			targetSize: calculateTargetSize(i, db.opts),
+	if db.levels == nil {
+		db.levels = make([]*Level, db.opts.MaxLevels)
+		db.levelMu = make([]sync.RWMutex, db.opts.MaxLevels)
+		for i := 0; i < db.opts.MaxLevels; i++ {
+			db.levels[i] = &Level{
+				level:      i,
+				sstFiles:   []*SSTFile{},
+				targetSize: calculateTargetSize(i, db.opts),
+			}
 		}
 	}
 }
@@ -1558,13 +1563,12 @@ func (db *DB) writeBatchToLog(entries []logEntry, sync bool) error {
 }
 
 func (db *DB) scanExistingSSTFiles() error {
-	// Check if levels are initialized
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	if db.levels == nil || len(db.levels) == 0 {
 		return errors.New("levels not initialized before scanning SST files")
 	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
 
 	files, err := os.ReadDir(db.name)
 	if err != nil {
@@ -1635,13 +1639,14 @@ func (db *DB) compactFilesToLevel(filesToCompact []*SSTFile, targetLevel int) {
 
 func calculateTargetSize(level int, opts *Options) int64 {
 	if level == 0 {
-		return 4 * int64(opts.WriteBufferSize) // Level 0 is special
+		return int64(opts.WriteBufferSize * 4)
 	}
-	base := int64(opts.WriteBufferSize)
-	for i := 1; i <= level; i++ {
-		base = int64(float64(base) * opts.LevelMultiplier)
+	baseSize := int64(opts.WriteBufferSize)
+	multiplier := opts.LevelMultiplier
+	if multiplier <= 0 {
+		multiplier = 10 // default value
 	}
-	return base
+	return int64(float64(baseSize) * math.Pow(multiplier, float64(level)))
 }
 
 func (db *DB) addSSTToLevel(fileNumber uint64, size int64, smallest, largest []byte) {
