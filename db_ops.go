@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,20 +94,21 @@ func Open(name string, opts *Options) (*DB, error) {
 	// Create new memtable
 	db.mem = newMemTable(db)
 
-	// Create new log file
-	logFilename := filepath.Join(name, fmt.Sprintf("log.%d", db.logNumber))
+	// Create new log file - ใช้ file number 1 แทน
+	logFilename := filepath.Join(name, "log.1")
 	logFile, err := os.OpenFile(logFilename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
 	db.logFile = logFile
+	db.logNumber = 1
 
 	// Write log header
 	if err := db.writeLogHeader(logFile); err != nil {
 		return nil, err
 	}
 
-	fmt.Println("New database created successfully")
+	fmt.Println("New database created successfully with log file")
 
 	return db, nil
 }
@@ -170,26 +172,12 @@ func (db *DB) CompactRange(rangeOpts *CompactionRange) error {
 func (db *DB) writeLogHeader(file *os.File) error {
 	header := logHeader{
 		version:    logVersion,
+		checksum:   crc32.ChecksumIEEE([]byte("leveldb_log")),
 		createTime: time.Now().UnixNano(),
+		reserved:   0,
 	}
 
-	// Calculate checksum
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, header.version)
-	binary.Write(&buf, binary.LittleEndian, header.createTime)
-	binary.Write(&buf, binary.LittleEndian, header.reserved)
-
-	header.checksum = crc32.ChecksumIEEE(buf.Bytes())
-
-	// Write header to file
-	buf.Reset()
-	binary.Write(&buf, binary.LittleEndian, header.version)
-	binary.Write(&buf, binary.LittleEndian, header.checksum)
-	binary.Write(&buf, binary.LittleEndian, header.createTime)
-	binary.Write(&buf, binary.LittleEndian, header.reserved)
-
-	_, err := file.Write(buf.Bytes())
-	return err
+	return binary.Write(file, binary.BigEndian, header)
 }
 
 func (db *DB) readAndVerifyLogHeader(file *os.File) error {
@@ -488,16 +476,39 @@ func (db *DB) GetCompactionStats() map[string]interface{} {
 }
 
 func encodeLogEntry(seq uint64, kind uint8, key, value []byte) []byte {
-	buf := make([]byte, 8+1+4+4+len(key)+len(value)+4)
-	binary.LittleEndian.PutUint64(buf[0:8], seq)
-	buf[8] = kind
-	binary.LittleEndian.PutUint32(buf[9:13], uint32(len(key)))
-	binary.LittleEndian.PutUint32(buf[13:17], uint32(len(value)))
-	copy(buf[17:17+len(key)], key)
-	copy(buf[17+len(key):17+len(key)+len(value)], value)
-	checksum := crc32.ChecksumIEEE(buf[:17+len(key)+len(value)])
-	binary.LittleEndian.PutUint32(buf[17+len(key)+len(value):], checksum)
-	return buf
+	buffer := make([]byte, 0, 8+1+4+4+len(key)+len(value)+4)
+
+	// Sequence number (8 bytes)
+	seqBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(seqBytes, seq)
+	buffer = append(buffer, seqBytes...)
+
+	// Kind (1 byte)
+	buffer = append(buffer, kind)
+
+	// Key length (4 bytes)
+	keyLenBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(keyLenBytes, uint32(len(key)))
+	buffer = append(buffer, keyLenBytes...)
+
+	// Value length (4 bytes)
+	valueLenBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(valueLenBytes, uint32(len(value)))
+	buffer = append(buffer, valueLenBytes...)
+
+	// Key
+	buffer = append(buffer, key...)
+
+	// Value
+	buffer = append(buffer, value...)
+
+	// Checksum (4 bytes) - simple checksum for now
+	checksum := crc32.ChecksumIEEE(buffer)
+	checksumBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(checksumBytes, checksum)
+	buffer = append(buffer, checksumBytes...)
+
+	return buffer
 }
 
 func (db *DB) Put(opts *WriteOptions, key, value []byte) error {
@@ -531,6 +542,8 @@ func (db *DB) writeInternal(opts *WriteOptions, key, value []byte, kind uint8) e
 		if opts != nil && opts.Sync {
 			db.logFile.Sync()
 		}
+	} else {
+		fmt.Println("Warning: logFile is nil, data not written to log")
 	}
 
 	// ตรวจสอบว่าต้องการ switch memtable หรือไม่
@@ -1138,8 +1151,102 @@ type indexEntry struct {
 }
 
 func (db *DB) recover() error {
-	// สำหรับการทดสอบ ข้าม recovery ก่อน
-	fmt.Println("Skipping recovery for testing")
+	db.initLevels()
+
+	files, err := os.ReadDir(db.name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// Find the latest log file
+	var logFiles []string
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "log.") {
+			logFiles = append(logFiles, file.Name())
+		}
+	}
+
+	if len(logFiles) == 0 {
+		return nil
+	}
+
+	sort.Strings(logFiles)
+	latestLog := logFiles[len(logFiles)-1]
+	logPath := filepath.Join(db.name, latestLog)
+
+	fmt.Printf("Attempting recovery from: %s\n", latestLog)
+
+	// Try to parse the log file
+	return db.parseLogFile(logPath)
+}
+
+func (db *DB) parseLogFile(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Debug: File size: %d bytes, Header size: %d bytes\n", len(data), logHeaderSize)
+
+	if len(data) <= logHeaderSize {
+		fmt.Println("Debug: No data beyond header")
+		return nil
+	}
+
+	// Skip header
+	offset := logHeaderSize
+	recovered := 0
+
+	fmt.Printf("Debug: Starting offset: %d\n", offset)
+
+	for offset < len(data) {
+		fmt.Printf("Debug: Offset %d/%d\n", offset, len(data))
+
+		if offset+17 > len(data) {
+			fmt.Println("Debug: Not enough data for metadata")
+			break
+		}
+
+		// Parse metadata
+		seq := binary.BigEndian.Uint64(data[offset : offset+8])
+		kind := data[offset+8]
+		keyLen := binary.BigEndian.Uint32(data[offset+9 : offset+13])
+		valLen := binary.BigEndian.Uint32(data[offset+13 : offset+17])
+
+		fmt.Printf("Debug: seq=%d, kind=%d, keyLen=%d, valLen=%d\n", seq, kind, keyLen, valLen)
+
+		totalSize := 17 + int(keyLen) + int(valLen) + 4
+		fmt.Printf("Debug: Total size needed: %d\n", totalSize)
+
+		if offset+totalSize > len(data) {
+			fmt.Printf("Debug: Not enough data (need %d, have %d)\n", totalSize, len(data)-offset)
+			break
+		}
+
+		// Extract data
+		key := string(data[offset+17 : offset+17+int(keyLen)])
+		value := string(data[offset+17+int(keyLen) : offset+17+int(keyLen)+int(valLen)])
+
+		fmt.Printf("Debug: key='%s', value='%s'\n", key, value)
+
+		// Add to memtable
+		if db.mem == nil {
+			db.mem = newMemTable(db)
+		}
+		db.mem.put(seq, kind, []byte(key), []byte(value), db)
+
+		if seq >= db.sequenceNumber.Load() {
+			db.sequenceNumber.Store(seq + 1)
+		}
+
+		recovered++
+		offset += totalSize
+	}
+
+	fmt.Printf("Debug: Recovered %d entries\n", recovered)
 	return nil
 }
 
@@ -1414,39 +1521,97 @@ func (db *DB) recoverLogFile(filename string) error {
 	}
 	defer file.Close()
 
-	// Skip header for now (simplify recovery)
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	// Get file size
+	info, err := file.Stat()
+	if err != nil {
 		return err
 	}
 
-	// Simple recovery: just read the raw data and apply to memtable
-	if db.mem == nil {
-		db.mem = newMemTable(db)
+	// If file is empty, skip
+	if info.Size() <= int64(logHeaderSize) {
+		return nil
 	}
 
-	buffer := make([]byte, 1024)
-	for {
-		n, err := file.Read(buffer)
-		if err == io.EOF {
+	// Read the entire file for simplicity
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return err
+	}
+
+	// Skip header
+	offset := logHeaderSize
+	recoveredEntries := 0
+
+	for offset < len(data) {
+		// Read sequence number (8 bytes)
+		if offset+8 > len(data) {
 			break
 		}
-		if err != nil {
-			return err
+		seq := binary.BigEndian.Uint64(data[offset : offset+8])
+		offset += 8
+
+		// Read kind (1 byte)
+		if offset+1 > len(data) {
+			break
+		}
+		kind := data[offset]
+		offset += 1
+
+		// Read key length (4 bytes)
+		if offset+4 > len(data) {
+			break
+		}
+		keyLen := binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+
+		// Read value length (4 bytes)
+		if offset+4 > len(data) {
+			break
+		}
+		valueLen := binary.BigEndian.Uint32(data[offset : offset+4])
+		offset += 4
+
+		// Read key
+		if offset+int(keyLen) > len(data) {
+			break
+		}
+		key := make([]byte, keyLen)
+		copy(key, data[offset:offset+int(keyLen)])
+		offset += int(keyLen)
+
+		// Read value (if exists)
+		var value []byte
+		if valueLen > 0 {
+			if offset+int(valueLen) > len(data) {
+				break
+			}
+			value = make([]byte, valueLen)
+			copy(value, data[offset:offset+int(valueLen)])
+			offset += int(valueLen)
 		}
 
-		// For now, just create a simple entry to test
-		// In real implementation, you'd parse the actual log format
-		if n >= len("persistent_key")+len("persistent_value")+20 {
-			// Simulate finding our test data
-			if bytes.Contains(buffer[:n], []byte("persistent_key")) {
-				db.mem.put(1, typeValue, []byte("persistent_key"), []byte("persistent_value"), db)
-				db.sequenceNumber.Store(2)
-				fmt.Printf("Recovered data from log: %s\n", filename)
-				return nil
-			}
+		// Read checksum (4 bytes) - skip verification for now
+		if offset+4 > len(data) {
+			break
 		}
+		offset += 4
+
+		// Apply to memtable
+		if db.mem == nil {
+			db.mem = newMemTable(db)
+		}
+		db.mem.put(seq, kind, key, value, db)
+
+		// Update sequence number
+		if seq >= db.sequenceNumber.Load() {
+			db.sequenceNumber.Store(seq + 1)
+		}
+
+		recoveredEntries++
+		fmt.Printf("Recovered: seq=%d, key=%s, value=%s\n", seq, string(key), string(value))
 	}
 
+	fmt.Printf("Recovered %d entries from %s\n", recoveredEntries, filename)
 	return nil
 }
 
