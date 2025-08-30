@@ -97,16 +97,33 @@ func (m *memTable) get(key []byte, maxSeq uint64) ([]byte, error) {
 	iter := m.table.iterator()
 	iter.Seek(key)
 
-	if iter.Valid() {
+	// หา entry ล่าสุดที่ match กับ key
+	var foundValue []byte
+	var foundSeq uint64
+	var foundKind uint8
+
+	for iter.Valid() {
 		currentKey := iter.Key()
 		decodedKey, seq, kind := decodeInternalKey(currentKey)
 
-		if bytes.Equal(decodedKey, key) && seq <= maxSeq {
-			if kind == typeDeletion {
-				return nil, ErrNotFound
-			}
-			return iter.Value(), nil
+		if !bytes.Equal(decodedKey, key) {
+			break // ไม่ใช่ key เดียวกัน
 		}
+
+		if seq <= maxSeq && seq > foundSeq {
+			foundSeq = seq
+			foundKind = kind
+			foundValue = iter.Value()
+		}
+
+		iter.Next()
+	}
+
+	if foundSeq > 0 {
+		if foundKind == typeDeletion {
+			return nil, ErrNotFound
+		}
+		return foundValue, nil
 	}
 
 	return nil, ErrNotFound
