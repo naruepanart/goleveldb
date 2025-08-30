@@ -43,15 +43,17 @@ type compactionState struct {
 const (
 	maxLogFileSize = 10 * 1024 * 1024 // 10MB
 	maxOldLogFiles = 5
-	logHeaderSize  = 16
+	logHeaderSize  = 20 // Increased to accommodate all fields
 	logVersion     = 1
+	logMagic       = 0xDB // Magic number to identify log files
 )
 
 type logHeader struct {
-	version    uint32
-	checksum   uint32
-	createTime int64
-	reserved   uint32
+	magic      uint32 // Magic number (0xDB)
+	version    uint32 // Version number
+	createTime int64  // Creation timestamp
+	reserved   uint32 // Reserved for future use
+	checksum   uint32 // Header checksum
 }
 
 func Open(name string, opts *Options) (*DB, error) {
@@ -86,7 +88,9 @@ func Open(name string, opts *Options) (*DB, error) {
 	db.initLevels()
 
 	// Initialize sequence number
-	db.sequenceNumber.Store(1)
+	if db.nextFileNumber == 1 {
+		db.sequenceNumber.Store(1)
+	}
 
 	// Initialize snapshot references
 	db.snapshotRefs = make(map[uint64]*Snapshot)
@@ -171,52 +175,63 @@ func (db *DB) CompactRange(rangeOpts *CompactionRange) error {
 
 func (db *DB) writeLogHeader(file *os.File) error {
 	header := logHeader{
+		magic:      logMagic,
 		version:    logVersion,
-		checksum:   crc32.ChecksumIEEE([]byte("leveldb_log")),
-		createTime: time.Now().UnixNano(),
+		createTime: time.Now().Unix(),
 		reserved:   0,
 	}
 
-	return binary.Write(file, binary.BigEndian, header)
-}
-
-func (db *DB) readAndVerifyLogHeader(file *os.File) error {
-	var header logHeader
-	err := binary.Read(file, binary.LittleEndian, &header.version)
-	if err != nil {
-		return err
-	}
-
-	err = binary.Read(file, binary.LittleEndian, &header.checksum)
-	if err != nil {
-		return err
-	}
-
-	err = binary.Read(file, binary.LittleEndian, &header.createTime)
-	if err != nil {
-		return err
-	}
-
-	err = binary.Read(file, binary.LittleEndian, &header.reserved)
-	if err != nil {
-		return err
-	}
-
-	// Verify checksum
+	// Calculate checksum
 	var buf bytes.Buffer
+	binary.Write(&buf, binary.LittleEndian, header.magic)
 	binary.Write(&buf, binary.LittleEndian, header.version)
 	binary.Write(&buf, binary.LittleEndian, header.createTime)
 	binary.Write(&buf, binary.LittleEndian, header.reserved)
 
-	calculatedChecksum := crc32.ChecksumIEEE(buf.Bytes())
-	if calculatedChecksum != header.checksum {
-		return fmt.Errorf("log header checksum mismatch: expected %x, got %x",
-			header.checksum, calculatedChecksum)
+	data := buf.Bytes()
+	header.checksum = crc32.ChecksumIEEE(data)
+
+	// Write the complete header with checksum
+	buf.Reset()
+	binary.Write(&buf, binary.LittleEndian, header.magic)
+	binary.Write(&buf, binary.LittleEndian, header.version)
+	binary.Write(&buf, binary.LittleEndian, header.createTime)
+	binary.Write(&buf, binary.LittleEndian, header.reserved)
+	binary.Write(&buf, binary.LittleEndian, header.checksum)
+
+	_, err := file.Write(buf.Bytes())
+	return err
+}
+
+func (db *DB) readAndVerifyLogHeader(file *os.File) error {
+	// Read the complete header (20 bytes)
+	headerBytes := make([]byte, 20)
+	_, err := file.Read(headerBytes)
+	if err != nil {
+		return err
 	}
 
-	// Verify version compatibility
+	var header logHeader
+	buf := bytes.NewReader(headerBytes)
+
+	binary.Read(buf, binary.LittleEndian, &header.magic)
+	binary.Read(buf, binary.LittleEndian, &header.version)
+	binary.Read(buf, binary.LittleEndian, &header.createTime)
+	binary.Read(buf, binary.LittleEndian, &header.reserved)
+	binary.Read(buf, binary.LittleEndian, &header.checksum)
+
+	if header.magic != logMagic {
+		return errors.New("invalid log file magic number")
+	}
+
 	if header.version != logVersion {
-		return fmt.Errorf("unsupported log version: %d", header.version)
+		return errors.New("unsupported log version")
+	}
+
+	// Verify checksum (excluding the checksum field itself)
+	expectedChecksum := crc32.ChecksumIEEE(headerBytes[:16])
+	if header.checksum != expectedChecksum {
+		return errors.New("log header checksum mismatch")
 	}
 
 	return nil
@@ -476,39 +491,39 @@ func (db *DB) GetCompactionStats() map[string]interface{} {
 }
 
 func encodeLogEntry(seq uint64, kind uint8, key, value []byte) []byte {
-	buffer := make([]byte, 0, 8+1+4+4+len(key)+len(value)+4)
+	buf := make([]byte, 0, 8+1+4+4+len(key)+len(value)+4)
 
 	// Sequence number (8 bytes)
 	seqBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(seqBytes, seq)
-	buffer = append(buffer, seqBytes...)
+	binary.LittleEndian.PutUint64(seqBytes, seq)
+	buf = append(buf, seqBytes...)
 
 	// Kind (1 byte)
-	buffer = append(buffer, kind)
+	buf = append(buf, kind)
 
-	// Key length (4 bytes)
+	// Key length (4 bytes) + Key
+	keyLen := uint32(len(key))
 	keyLenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(keyLenBytes, uint32(len(key)))
-	buffer = append(buffer, keyLenBytes...)
+	binary.LittleEndian.PutUint32(keyLenBytes, keyLen)
+	buf = append(buf, keyLenBytes...)
+	buf = append(buf, key...)
 
-	// Value length (4 bytes)
-	valueLenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(valueLenBytes, uint32(len(value)))
-	buffer = append(buffer, valueLenBytes...)
+	// Value length (4 bytes) + Value (if not deletion)
+	if kind == typeValue {
+		valueLen := uint32(len(value))
+		valueLenBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(valueLenBytes, valueLen)
+		buf = append(buf, valueLenBytes...)
+		buf = append(buf, value...)
+	}
 
-	// Key
-	buffer = append(buffer, key...)
-
-	// Value
-	buffer = append(buffer, value...)
-
-	// Checksum (4 bytes) - simple checksum for now
-	checksum := crc32.ChecksumIEEE(buffer)
+	// Checksum (4 bytes)
+	checksum := crc32.ChecksumIEEE(buf[:len(buf)-4])
 	checksumBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(checksumBytes, checksum)
-	buffer = append(buffer, checksumBytes...)
+	binary.LittleEndian.PutUint32(checksumBytes, checksum)
+	buf = append(buf, checksumBytes...)
 
-	return buffer
+	return buf
 }
 
 func (db *DB) Put(opts *WriteOptions, key, value []byte) error {
@@ -523,33 +538,50 @@ func (db *DB) writeInternal(opts *WriteOptions, key, value []byte, kind uint8) e
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// เพิ่ม sequence number
-	seq := db.sequenceNumber.Add(1)
-
-	// เขียนลง memtable
-	if db.mem == nil {
-		db.mem = newMemTable(db)
+	// Check if writes should be stalled due to compaction
+	if db.shouldStallWrites() {
+		db.writeStallMu.Lock()
+		for db.shouldStallWrites() {
+			db.writeStallCond.Wait()
+		}
+		db.writeStallMu.Unlock()
 	}
+
+	// Get next sequence number
+	seq := db.sequenceNumber.Load()
+	db.sequenceNumber.Store(seq + 1)
+
+	// Encode the log entry
+	entry := encodeLogEntry(seq, kind, key, value)
+
+	// Write to log file with checksum
+	if db.logFile != nil {
+		if _, err := db.logFile.Write(entry); err != nil {
+			return fmt.Errorf("failed to write to log: %v", err)
+		}
+
+		// Sync if requested
+		if opts != nil && opts.Sync {
+			if err := db.logFile.Sync(); err != nil {
+				return fmt.Errorf("failed to sync log: %v", err)
+			}
+		}
+	}
+
+	// Write to memtable
 	db.mem.put(seq, kind, key, value, db)
 
-	// เขียนลง write-ahead log
-	entry := encodeLogEntry(seq, kind, key, value)
-	if db.logFile != nil {
-		_, err := db.logFile.Write(entry)
-		if err != nil {
-			return err
-		}
-		if opts != nil && opts.Sync {
-			db.logFile.Sync()
-		}
-	} else {
-		fmt.Println("Warning: logFile is nil, data not written to log")
+	// Update memtable size
+	entrySize := len(key) + len(value) + 8 + 1 // key + value + seq(8) + kind(1)
+	db.updateMemtableSize(entrySize)
+
+	// Check if memtable needs to be switched
+	if db.mem.approximateMemoryUsage() >= db.opts.WriteBufferSize {
+		go db.switchMemTable()
 	}
 
-	// ตรวจสอบว่าต้องการ switch memtable หรือไม่
-	if db.mem.approximateMemoryUsage() >= db.opts.WriteBufferSize {
-		db.switchMemTable()
-	}
+	// Update statistics
+	db.incrementWrites()
 
 	return nil
 }
@@ -1521,97 +1553,88 @@ func (db *DB) recoverLogFile(filename string) error {
 	}
 	defer file.Close()
 
-	// Get file size
-	info, err := file.Stat()
-	if err != nil {
-		return err
+	// Read and verify header
+	if err := db.readAndVerifyLogHeader(file); err != nil {
+		return fmt.Errorf("invalid log header: %v", err)
 	}
 
-	// If file is empty, skip
-	if info.Size() <= int64(logHeaderSize) {
-		return nil
-	}
-
-	// Read the entire file for simplicity
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return err
-	}
-
-	// Skip header
-	offset := logHeaderSize
-	recoveredEntries := 0
-
-	for offset < len(data) {
+	// Read entries
+	for {
 		// Read sequence number (8 bytes)
-		if offset+8 > len(data) {
-			break
-		}
-		seq := binary.BigEndian.Uint64(data[offset : offset+8])
-		offset += 8
-
-		// Read kind (1 byte)
-		if offset+1 > len(data) {
-			break
-		}
-		kind := data[offset]
-		offset += 1
-
-		// Read key length (4 bytes)
-		if offset+4 > len(data) {
-			break
-		}
-		keyLen := binary.BigEndian.Uint32(data[offset : offset+4])
-		offset += 4
-
-		// Read value length (4 bytes)
-		if offset+4 > len(data) {
-			break
-		}
-		valueLen := binary.BigEndian.Uint32(data[offset : offset+4])
-		offset += 4
-
-		// Read key
-		if offset+int(keyLen) > len(data) {
-			break
-		}
-		key := make([]byte, keyLen)
-		copy(key, data[offset:offset+int(keyLen)])
-		offset += int(keyLen)
-
-		// Read value (if exists)
-		var value []byte
-		if valueLen > 0 {
-			if offset+int(valueLen) > len(data) {
+		seqBytes := make([]byte, 8)
+		if _, err := io.ReadFull(file, seqBytes); err != nil {
+			if err == io.EOF {
 				break
 			}
-			value = make([]byte, valueLen)
-			copy(value, data[offset:offset+int(valueLen)])
-			offset += int(valueLen)
+			return err
+		}
+		seq := binary.LittleEndian.Uint64(seqBytes)
+
+		// Read kind (1 byte)
+		kindBytes := make([]byte, 1)
+		if _, err := io.ReadFull(file, kindBytes); err != nil {
+			return err
+		}
+		kind := kindBytes[0]
+
+		// Read key length and key
+		keyLenBytes := make([]byte, 4)
+		if _, err := io.ReadFull(file, keyLenBytes); err != nil {
+			return err
+		}
+		keyLen := binary.LittleEndian.Uint32(keyLenBytes)
+		key := make([]byte, keyLen)
+		if _, err := io.ReadFull(file, key); err != nil {
+			return err
 		}
 
-		// Read checksum (4 bytes) - skip verification for now
-		if offset+4 > len(data) {
-			break
+		// Declare valueLenBytes outside the if block
+		var valueLenBytes []byte
+		var value []byte
+
+		if kind == typeValue {
+			// Read value length and value
+			valueLenBytes = make([]byte, 4)
+			if _, err := io.ReadFull(file, valueLenBytes); err != nil {
+				return err
+			}
+			valueLen := binary.LittleEndian.Uint32(valueLenBytes)
+			value = make([]byte, valueLen)
+			if _, err := io.ReadFull(file, value); err != nil {
+				return err
+			}
 		}
-		offset += 4
+
+		// Read and verify checksum
+		storedChecksumBytes := make([]byte, 4)
+		if _, err := io.ReadFull(file, storedChecksumBytes); err != nil {
+			return err
+		}
+		storedChecksum := binary.LittleEndian.Uint32(storedChecksumBytes)
+
+		// Verify checksum (reconstruct the data without the stored checksum)
+		data := make([]byte, 0)
+		data = append(data, seqBytes...)
+		data = append(data, kindBytes...)
+		data = append(data, keyLenBytes...)
+		data = append(data, key...)
+		if kind == typeValue {
+			data = append(data, valueLenBytes...)
+			data = append(data, value...)
+		}
+
+		calculatedChecksum := crc32.ChecksumIEEE(data)
+		if calculatedChecksum != storedChecksum {
+			return fmt.Errorf("checksum mismatch for entry")
+		}
 
 		// Apply to memtable
-		if db.mem == nil {
-			db.mem = newMemTable(db)
-		}
 		db.mem.put(seq, kind, key, value, db)
 
-		// Update sequence number
-		if seq >= db.sequenceNumber.Load() {
-			db.sequenceNumber.Store(seq + 1)
-		}
-
-		recoveredEntries++
-		fmt.Printf("Recovered: seq=%d, key=%s, value=%s\n", seq, string(key), string(value))
+		fmt.Printf("Recovered entry: seq=%d, kind=%d, key=%s, value=%s\n",
+			seq, kind, string(key), string(value))
 	}
 
-	fmt.Printf("Recovered %d entries from %s\n", recoveredEntries, filename)
 	return nil
 }
 
@@ -1642,10 +1665,9 @@ func (db *DB) writeBatchToLog(entries []logEntry, sync bool) error {
 		return fmt.Errorf("batch write to log failed: %w", err)
 	}
 
-	// Sync if required
 	if sync {
 		if err := db.logFile.Sync(); err != nil {
-			return fmt.Errorf("log sync failed: %w", err)
+			return fmt.Errorf("failed to sync log file: %v", err)
 		}
 	}
 
